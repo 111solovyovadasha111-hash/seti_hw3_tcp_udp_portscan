@@ -1,28 +1,88 @@
-from scapy.all import conf, send, sr1
+import random
+import time
+
+from scapy.all import conf
 from scapy.layers.inet import IP, TCP
+from selectors import EVENT_READ
+from selector import make_selector
 
 
 conf.verb = 0 # отключение вывода в консоль
 
 
-def syn_scan(host, port, timeout = 1.0):
+SYN_ACK = 0x12
+RST_FLAG = 0x04
+MASK32 = 0xFFFFFFFF
+MSS = 1460
 
-  packet = IP(dst=host) / TCP(dport=port, flags="S") # ip заголовок + tcp заголовок с флагом syn
 
-  response = sr1(packet, timeout=timeout) # отправляем пакет и ждем первый ответный
+def scan_tcp(host, ports, timeout, window):
+    """ возвращает словарь: открытый порт -> время ответа в мс.
+    window: максимум syn ожидающих ответа одновременно. """
+    sport = random.randint(40000, 60000)  # исходный порт
 
-  if response is None:
-    return "FILTERED (нет ответа)"
+    sock = conf.L3socket()  # многоразовый сокет
+    sel = make_selector()
+    sel.register(sock.fileno(), EVENT_READ) # регистрируем файловый дескриптор для сокета в селекторе, чтобы реагировать на пакеты
 
-  if response.haslayer(TCP):
-    flags = response.getlayer(TCP).flags
+    seqs = {} # port -> seq (номер первого байта отправленного пакета) нашего SYN
+    pending = {} # port -> момент отправки syn, очередь активных проверок без ответа
+    opened = {} # port -> время ответа, мс итоговый рез
 
-    if flags == 0x12: # syn + ack
-      rst_packet = IP(dst=host) / TCP(dport=port, flags="R") # сброс полуоткрытого соединения, rst
-      send(rst_packet)
-      return "OPEN"
+    def del_old_port(now):
+        """удаление старых портов по таймауту"""
+        while pending:
+            port = next(iter(pending))
+            if now - pending[port] < timeout:
+                break
+            del pending[port]
 
-    elif flags == 0x14 or flags == 0x04: # rst + ack - порт закрыт
-      return "CLOSED"
+    def handle_packet(packet):
+        """ разбор пойманного пакета"""
+        ip = packet.getlayer(IP)
+        tcp = packet.getlayer(TCP)
+        if ip is None or tcp is None or ip.src != host or tcp.dport != sport:
+            return # левый пакет
 
-  return "FILTERED (ICMP ошибка)"
+        port = tcp.sport
+        if port not in seqs or tcp.ack != ((seqs[port] + 1) & MASK32):
+            return  # ответ не на наш SYN
+
+        flags = int(tcp.flags)
+        if (flags & SYN_ACK) == SYN_ACK: # syn+ack
+            # закрываем полуоткрытое соединение флагом сброса rst
+            sock.send(IP(dst=host) / TCP(sport=sport, dport=port, flags="R", seq=tcp.ack))
+            t_sent = pending.pop(port, None)
+            if t_sent is not None:
+                opened[port] = (time.monotonic() - t_sent) * 1000
+        elif flags & RST_FLAG:
+            pending.pop(port, None)
+
+    def poll():
+        now = time.monotonic()
+        del_old_port(now)
+        if not pending:
+            return
+        oldest = next(iter(pending.values()))
+        if sel.select(max(0.0, oldest + timeout - now)):# ждем событие до смерти старейшего
+            packet = sock.recv()
+            if packet is not None:
+                handle_packet(packet)
+        del_old_port(time.monotonic())
+
+    try:
+        for port in ports:
+            while len(pending) >= window: # нельзя отправить новый syn пока ожидаемая очередь пакетов больше окна
+                poll()
+            seq = random.getrandbits(32)
+            seqs[port] = seq
+            pending[port] = time.monotonic()
+            sock.send(IP(dst=host) / TCP(sport=sport, dport=port, flags="S",
+                seq=seq, options=[("MSS", MSS)]))
+        while pending:
+            poll()
+    finally:
+        sel.close()
+        sock.close()
+
+    return opened
